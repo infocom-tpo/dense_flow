@@ -1,12 +1,14 @@
 #include "opencv2/video/tracking.hpp"
 #include "opencv2/imgproc/imgproc.hpp"
 #include "opencv2/highgui/highgui.hpp"
-#include "opencv2/gpu/gpu.hpp"
+#include "opencv2/cudaoptflow.hpp"
+#include "opencv2/cudaarithm.hpp"
 
 #include <stdio.h>
 #include <iostream>
+
 using namespace cv;
-using namespace cv::gpu;
+using namespace cv::cuda;
 
 static void convertFlowToImage(const Mat &flow_x, const Mat &flow_y, Mat &img_x, Mat &img_y,
        double lowerBound, double higherBound) {
@@ -37,25 +39,25 @@ int main(int argc, char** argv){
 	// IO operation
 	const char* keys =
 		{
-			"{ f  | vidFile      | ex2.avi | filename of video }"
-			"{ x  | xFlowFile    | flow_x | filename of flow x component }"
-			"{ y  | yFlowFile    | flow_y | filename of flow x component }"
-			"{ i  | imgFile      | flow_i | filename of flow image}"
-			"{ b  | bound | 15 | specify the maximum of optical flow}"
-			"{ t  | type | 0 | specify the optical flow algorithm }"
-			"{ d  | device_id    | 0  | set gpu id}"
-			"{ s  | step  | 1 | specify the step for frame sampling}"
+			"{ f  or vidFile      | ex2.avi | filename of video }"
+			"{ x  or xFlowFile    | flow_x | filename of flow x component }"
+			"{ y  or yFlowFile    | flow_y | filename of flow x component }"
+			"{ i  or imgFile      | flow_i | filename of flow image}"
+			"{ b  or bound | 15 | specify the maximum of optical flow}"
+			"{ t  or type | 0 | specify the optical flow algorithm }"
+			"{ d  or device_id    | 0  | set gpu id}"
+			"{ s  or step  | 1 | specify the step for frame sampling}"
 		};
-
+	
 	CommandLineParser cmd(argc, argv, keys);
-	string vidFile = cmd.get<string>("vidFile");
-	string xFlowFile = cmd.get<string>("xFlowFile");
-	string yFlowFile = cmd.get<string>("yFlowFile");
-	string imgFile = cmd.get<string>("imgFile");
+	std::string vidFile = cmd.get<std::string>("vidFile");
+	std::string xFlowFile = cmd.get<std::string>("xFlowFile");
+	std::string yFlowFile = cmd.get<std::string>("yFlowFile");
+	std::string imgFile = cmd.get<std::string>("imgFile");
 	int bound = cmd.get<int>("bound");
-        int type  = cmd.get<int>("type");
-        int device_id = cmd.get<int>("device_id");
-        int step = cmd.get<int>("step");
+	int type  = cmd.get<int>("type");
+	int device_id = cmd.get<int>("device_id");
+	int step = cmd.get<int>("step");
 
 	VideoCapture capture(vidFile);
 	if(!capture.isOpened()) {
@@ -65,12 +67,12 @@ int main(int argc, char** argv){
 
 	int frame_num = 0;
 	Mat image, prev_image, prev_grey, grey, frame, flow_x, flow_y;
-	GpuMat frame_0, frame_1, flow_u, flow_v;
+	GpuMat frame_0, frame_1, d_flow;
 
 	setDevice(device_id);
-	FarnebackOpticalFlow alg_farn;
-	OpticalFlowDual_TVL1_GPU alg_tvl1;
-	BroxOpticalFlow alg_brox(0.197f, 50.0f, 0.8f, 10, 77, 10);
+	Ptr<cuda::FarnebackOpticalFlow> alg_farn = cuda::FarnebackOpticalFlow::create();
+	Ptr<cuda::OpticalFlowDual_TVL1> alg_tvl1 = cuda::OpticalFlowDual_TVL1::create();
+	Ptr<cuda::BroxOpticalFlow> alg_brox = cuda::BroxOpticalFlow::create(0.197f, 50.0f, 0.8f, 10, 77, 10);
 
 	while(true) {
 		capture >> frame;
@@ -83,7 +85,7 @@ int main(int argc, char** argv){
 			prev_grey.create(frame.size(), CV_8UC1);
 
 			frame.copyTo(prev_image);
-			cvtColor(prev_image, prev_grey, CV_BGR2GRAY);
+			cvtColor(prev_image, prev_grey, COLOR_BGR2GRAY);
 
 			frame_num++;
 
@@ -96,7 +98,7 @@ int main(int argc, char** argv){
 		}
 
 		frame.copyTo(image);
-		cvtColor(image, grey, CV_BGR2GRAY);
+		cvtColor(image, grey, COLOR_BGR2GRAY);
 
                //  Mat prev_grey_, grey_;
                //  resize(prev_grey, prev_grey_, Size(453, 342));
@@ -104,25 +106,28 @@ int main(int argc, char** argv){
 		frame_0.upload(prev_grey);
 		frame_1.upload(grey);
 
+		GpuMat planes[2];
 
         // GPU optical flow
 		switch(type){
 		case 0:
-			alg_farn(frame_0,frame_1,flow_u,flow_v);
+			alg_farn->calc(frame_0, frame_1, d_flow);
 			break;
 		case 1:
-			alg_tvl1(frame_0,frame_1,flow_u,flow_v);
+			alg_farn->calc(frame_0, frame_1, d_flow);
 			break;
 		case 2:
 			GpuMat d_frame0f, d_frame1f;
 	        frame_0.convertTo(d_frame0f, CV_32F, 1.0 / 255.0);
 	        frame_1.convertTo(d_frame1f, CV_32F, 1.0 / 255.0);
-			alg_brox(d_frame0f, d_frame1f, flow_u,flow_v);
+			alg_brox->calc(d_frame0f, d_frame1f, d_flow);
 			break;
 		}
 
-		flow_u.download(flow_x);
-		flow_v.download(flow_y);
+		cuda::split(d_flow, planes);
+
+		planes[0].download(flow_x);
+		planes[1].download(flow_y);
 
 		// Output optical flow
 		Mat imgX(flow_x.size(),CV_8UC1);
